@@ -24,7 +24,13 @@ from nltk.stem.wordnet import WordNetLemmatizer
 from nltk.corpus import stopwords
 import nltk
 from nltk import word_tokenize
+import pickle
+import itertools
 import re
+
+nltk.download('stopwords')
+nltk.download('punkt')
+nltk.download('wordnet')
 
 with open('.../train-v2.0.json') as f:
     data = json.load(f)
@@ -56,6 +62,21 @@ for d in data['data']:
         question.append(b)
         context.append(p['context'])
 
+vocab_size = 83000
+
+def create_model_qans(m):
+    inp = Input(shape = (m-1, 100, ))
+    lstm_layer = Bidirectional(LSTM(128))(inp)
+    dense = [[] for i in range(m)]
+    dropout = [[] for i in range(m)]
+    for i in range(m):
+        dense[i] = Dense(vocab_size, activation = 'softmax')(lstm_layer)
+
+    for i in range(m):
+        dropout[i] = Dense(vocab_size, activation = 'softmax')(dense[i])
+    model = Model(inputs = inp, output = dropout)
+    return model
+
 def remove_stopwords(text):
     words = word_tokenize(text)
     output_text = []
@@ -82,21 +103,32 @@ def context_preprocessing(data):
 
 output_context = context_preprocessing(context)
 
-print(output_context[0])
-
 vocab_size = 83000
 tokenizer = Tokenizer(num_words= vocab_size)
 tokenizer.fit_on_texts(output_context)
 
 context_sequences = tokenizer.texts_to_sequences(output_context)
 
-m = 0
-for seq in context_sequences:
-    m = max(m, len(seq))
+del output_context
+
+def get_max_length(sequence):
+    m = 0
+    for seq in sequence:
+        try:
+            for s in seq:
+                m= max(m, len(s))
+        except:
+            m = max(m, len(seq))
+    return m
+
+m = get_max_length(context_sequences)
+print(m)
 
 data = pad_sequences(context_sequences, maxlen=m)
 X, y = data[:,:-1],data[:,-1]
 y = to_categorical(y, num_classes=vocab_size)
+
+del context_sequences
 
 def question_preprocessing(questions):
     output_question = []
@@ -117,13 +149,29 @@ def question_preprocessing(questions):
         output_question.append(cont_ques)
     return output_question
 
-output_question = question_preprocessing(question)
+def question_to_sequence(question):
+    question_sequence = []
+    output_question = question_preprocessing(question)
+    for seq in range(len(output_question)):
+        q_seq = []
+        for q in output_question[seq]:
+            q_seq.append(tokenizer.texts_to_sequences(q))
+        question_sequence.append(q_seq)
+        del q_seq
+    del output_question
+    return question_sequence
 
-question_sequences = tokenizer.texts_to_sequences(output_question)
+def padded_sequence_question(question_sequences ,m):
+    padded_question_sequence = []
+    for seq in question_sequences:
+        q_seq = []
+        for s in seq:
+            q_seq.append(pad_sequences(s, maxlen=m))
+        padded_question_sequence.append(q_seq)
+        del q_seq
+    return padded_question_sequence
 
-question_sequences = pad_sequences(question_sequences, maxlen=m)
-
-def create_model():
+def create_context_model(m):
     inp = Input(shape = (m-1, ))
     embedding = Embedding(vocab_size, 100)(inp)
     lstm_layer = LSTM(100)(embedding)
@@ -133,40 +181,100 @@ def create_model():
     print(model.summary())
     return model
 
-model = create_model()
+print(m)
+model = create_context_model(m)
 model.compile(optimizer = 'adam', loss = 'categorical_crossentropy', metrics=['accuracy'])
 
-model.fit(X, y, batch_size = 128, epochs = 50)
+model.fit(X, y, batch_size = 128, epochs = 10)
 
 embeddings = model.layers[1].get_weights()[0]
 
-def create_model_qans():
+def create_model_qans(m = 400):
     inp = Input(shape = (m-1, 100, ))
     lstm_layer = Bidirectional(LSTM(128))(inp)
-    dense_1 = Dense(vocab_size, activation = 'softmax')(lstm_layer)
-    dropout_1 = Dropout(0.25)(dense_1)
-    model = Model(inputs = inp, output = dropout_1)
+    dense = [[] for i in range(100)]
+    dropout = [[] for i in range(100)]
+    for i in range(100):
+        dense[i] = Dense(vocab_size, activation = 'softmax')(lstm_layer)
+        dropout[i] = Dropout(0.25)(dense[i])
+    model = Model(inputs = inp, output = dropout)
     return model
 
 model_qans = create_model_qans()
+model_qans.compile(optimizer = 'adam', loss = 'mse')
 
-question_sequences = []
-for que in output_question:
-    que_sequence = tokenizer.texts_to_sequences(que)
-    question_sequences.append(que_sequence)
+import pickle as pkl
+with open('embeddings.pickle', 'wb') as f:
+    pkl.dump(embeddings, f)
 
-m = 0
-for seq in question_sequences:
-    for s in seq:
-        m = max(m, len(s))
-print(m)
+with open('context_data.pickle', 'wb') as f:
+    pkl.dump(data, f)
 
-padded_question_sequence = []
-for seq in question_sequences:
-    q_seq = []
-    for s in seq:
-        q_seq.append(pad_sequences(seq, maxlen=m))
-    padded_question_sequence.append(q_seq)
+del data, X, y
 
-print(len(padded_question_sequence))
+def answer_preprocessing(answer):
+    output_answer = []
+    for ans in answer:
+        cont_ans = []
+        for q in ans:
+            q = q[0]
+            q = lemmatizer.lemmatize(q)
+            d = q.lower()
+            d = remove_stopwords(d)
+            d = lemmatizer.lemmatize(d)
+            d = d.replace(',', ' [COM] ')
+            d = d.replace('.', ' [EOS] ')
+            d = d.replace('?', ' [EOS] ')  
+            d = d.replace("'s", '')
+            c = ' '.join(re.sub("[\(\)\"\"\']","",d).split())
+            cont_ans.append(c)
+        output_answer.append(cont_ans)
+    return output_answer
+
+def answer_to_sequence(answer):
+    answer_sequence = []
+    output_answer = answer_preprocessing(answer)
+    for seq in range(len(output_answer)):
+        a_seq = []
+        for a in output_answer[seq]:
+            a_seq.append(tokenizer.texts_to_sequences(a))
+        answer_sequence.append(a_seq)
+        del a_seq
+    del output_answer
+    return answer_sequence
+
+def padded_sequence_answer(answer_sequences ,m=100):
+    padded_answer_sequence = []
+    for seq in answer_sequences:
+        a_seq = []
+        for s in seq:
+            a_seq.append(pad_sequences(s, maxlen=m))
+        padded_answer_sequence.append(a_seq)
+        del a_seq
+    return padded_answer_sequence
+
+m = 400
+batch_size = 32
+epochs = 10
+for epoch in range(epochs):
+    for i in range(0,len(question)-batch_size, batch_size):
+        try:
+            q = question[i:i+batch_size]
+            a = answers[i:i+batch_size]
+        except IndexError: 
+            q = question[i:]
+            a = answers[i:]
+        question_sequence = padded_sequence_question(question_to_sequence(q), m)
+        answer_sequence = padded_sequence_answer(answer_to_sequence(a))
+        
+        embedding_question_sequence = []
+        embedding_answer_sequence = []
+        for que in question_sequence:
+            for q in que:
+                embedding_question_sequence.append(embeddings[q])
+        del question_sequence
+        for ans in answer_sequence:
+            for a in ans:
+                embedding_answer_sequence.append(embeddings[a])
+        model_qans.fit(embedding_question_sequence, embedding_answer_sequence)
 
